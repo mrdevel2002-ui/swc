@@ -2075,6 +2075,17 @@ struct ExportQuery<'a> {
 impl ExportQuery<'_> {
     fn runtime_access(&self, ident: &Ident) -> Option<RuntimeAccess<'_>> {
         let id = ident.to_id();
+        if self.contexts.is_empty() {
+            // Outside emitted containers only the legacy export fallback can
+            // apply. Check its smaller index before looking up a declaration;
+            // a shared member still requires a current emitted owner.
+            let object = self.export_name.get(&id)?.as_ref()?;
+            return self
+                .bindings
+                .member_of(&id)
+                .is_none()
+                .then_some(RuntimeAccess::NamespaceProperty(object));
+        }
         let declaration = self.bindings.declaration_id(&id);
         let container = declaration.and_then(|id| self.bindings.declaration_container(id));
         let member = declaration.and_then(|id| self.bindings.declaration_member(id));
