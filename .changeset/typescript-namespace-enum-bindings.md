@@ -1,4 +1,5 @@
 ---
+swc: patch
 swc_atoms: patch
 swc_core: minor
 swc_ecma_transforms_base: patch

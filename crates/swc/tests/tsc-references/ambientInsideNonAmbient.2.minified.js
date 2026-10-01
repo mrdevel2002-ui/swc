@@ -1,3 +1,3 @@
 //// [ambientInsideNonAmbient.ts]
-var M, M2;
-M || (M = {}), M2 || (M2 = {});
+var M;
+M || (M = {});
