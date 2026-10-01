@@ -2,6 +2,7 @@ use std::{fmt::Write, io, str};
 
 use ascii::AsciiChar;
 use compact_str::CompactString;
+use memchr::memchr2;
 use swc_atoms::wtf8::{CodePoint, Wtf8};
 use swc_common::{Spanned, DUMMY_SP};
 use swc_ecma_ast::*;
@@ -96,7 +97,7 @@ impl MacroNode for Str {
         if &*self.value == "use strict"
             && self.raw.is_some()
             && self.raw.as_ref().unwrap().contains('\\')
-            && (!emitter.cfg.inline_script || !self.raw.as_ref().unwrap().contains("script"))
+            && (!emitter.cfg.inline_script || is_inline_script_safe(self.raw.as_ref().unwrap()))
         {
             emitter
                 .wr
@@ -122,8 +123,7 @@ impl MacroNode for Str {
 
                 if es5_safe
                     && (!emitter.cfg.ascii_only || raw.is_ascii())
-                    && (!emitter.cfg.inline_script
-                        || !self.raw.as_ref().unwrap().contains("script"))
+                    && (!emitter.cfg.inline_script || is_inline_script_safe(raw))
                 {
                     emitter.wr.write_str_lit(DUMMY_SP, raw)?;
                     return Ok(());
@@ -212,6 +212,21 @@ impl MacroNode for Bool {
 
         Ok(())
     }
+}
+
+/// Returns `true` if `text` can be emitted verbatim inside an HTML `<script>`
+/// element.
+///
+/// Derived from [`escape_inline_script`] rather than re-implemented, so the two
+/// cannot disagree about which sequences are HTML-sensitive.
+pub(crate) fn is_inline_script_safe(text: &str) -> bool {
+    // Every sequence the escaper rewrites starts with `<` or `-`, so skip the
+    // substring searches for the overwhelmingly common case.
+    if memchr2(b'<', b'-', text.as_bytes()).is_none() {
+        return true;
+    }
+
+    matches!(escape_inline_script(text), CowStr::Borrowed(..))
 }
 
 /// Escape HTML-sensitive sequences after JavaScript string escaping is

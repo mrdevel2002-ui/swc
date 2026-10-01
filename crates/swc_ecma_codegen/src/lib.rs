@@ -2230,7 +2230,14 @@ impl MacroNode for Tpl {
 impl MacroNode for TplElement {
     fn emit(&mut self, emitter: &mut Macro) -> Result {
         let raw = self.raw.replace("\r\n", "\n").replace('\r', "\n");
-        if emitter.cfg.minify || (emitter.cfg.ascii_only && !self.raw.is_ascii()) {
+        // Untagged template text is written verbatim below, so HTML-sensitive
+        // sequences in the source survive into the output. Normalizing the raw
+        // text is what makes escaping it safe: substituting `<!--` directly in
+        // raw text would merge the replacement with a preceding backslash.
+        if emitter.cfg.minify
+            || (emitter.cfg.ascii_only && !self.raw.is_ascii())
+            || (emitter.cfg.inline_script && !lit::is_inline_script_safe(&raw))
+        {
             let v = get_template_element_from_raw(
                 &raw,
                 emitter.cfg.ascii_only,
