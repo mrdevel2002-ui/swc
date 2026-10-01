@@ -9,9 +9,13 @@ use swc_common::{
 use swc_ecma_ast::*;
 use swc_ecma_transforms_base::rename::rename;
 use swc_ecma_utils::{
-    alias_ident_for, constructor::inject_after_super, ident::IdentLike, is_literal, member_expr,
-    private_ident, quote_ident, quote_str, stack_size::maybe_grow_default, ExprFactory, QueryRef,
-    RefRewriter, StmtLikeInjector,
+    alias_ident_for,
+    constructor::inject_after_super,
+    ident::IdentLike,
+    is_literal, member_expr, private_ident, quote_ident, quote_str,
+    stack_size::maybe_grow_default,
+    ts_bindings::{TsBindings, TsContainerId, TsMemberId},
+    ExprFactory, QueryRef, RefRewriter, StmtLikeInjector,
 };
 use swc_ecma_visit::{
     noop_visit_mut_type, visit_mut_pass, Visit, VisitMut, VisitMutWith, VisitWith,
@@ -19,7 +23,7 @@ use swc_ecma_visit::{
 
 use crate::{
     config::TsImportExportAssignConfig,
-    retain::{should_retain_module_item, should_retain_stmt},
+    retain::{should_retain_decl, should_retain_module_item, should_retain_stmt},
     semantic::SemanticInfo,
     shared::enum_member_name,
     ts_enum::{
@@ -69,7 +73,8 @@ pub(crate) struct Transform {
     in_namespace: bool,
     is_lhs: bool,
 
-    ref_rewriter: Option<RefRewriter<ExportQuery>>,
+    in_binding: bool,
+    namespace_contexts: Vec<NamespaceContext>,
 
     decl_id_record: FxHashSet<Id>,
     namespace_id: Option<Id>,
@@ -79,6 +84,64 @@ pub(crate) struct Transform {
 
     in_class_prop: Vec<Id>,
     in_class_prop_init: Vec<Box<Expr>>,
+}
+
+/// The JS bindings that this particular emitted container body provides.
+/// Exported variables, enums, aliases and nested namespaces are properties;
+/// functions and classes retain a body-local declaration.
+struct NamespaceContext {
+    container: TsContainerId,
+    object: Id,
+    locals: FxHashMap<TsMemberId, Id>,
+}
+
+impl Transform {
+    fn namespace_context(&self, object: Id, body: &TsNamespaceBody) -> Option<NamespaceContext> {
+        let container = self.semantic.bindings.container(&object)?;
+        let mut locals = FxHashMap::default();
+
+        if let TsNamespaceBody::TsModuleBlock(body) = body {
+            for item in &body.body {
+                let ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(decl)) = item else {
+                    continue;
+                };
+                if !should_retain_decl(&decl.decl) {
+                    continue;
+                }
+                let ident = match &decl.decl {
+                    Decl::Fn(decl) => &decl.ident,
+                    Decl::Class(decl) => &decl.ident,
+                    _ => continue,
+                };
+                if let Some(member) = self.semantic.bindings.member_of(&ident.to_id()) {
+                    locals.insert(member, ident.to_id());
+                }
+            }
+        }
+
+        Some(NamespaceContext {
+            container,
+            object,
+            locals,
+        })
+    }
+
+    fn ref_rewriter(&self) -> Option<RefRewriter<ExportQuery<'_>>> {
+        if self.in_binding
+            || (self.semantic.exported_binding.is_empty()
+                && !self.semantic.bindings.has_namespace_bodies())
+        {
+            return None;
+        }
+
+        Some(RefRewriter {
+            query: ExportQuery {
+                export_name: &self.semantic.exported_binding,
+                bindings: &self.semantic.bindings,
+                contexts: &self.namespace_contexts,
+            },
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -122,13 +185,6 @@ impl VisitMut for Transform {
     );
 
     fn visit_mut_program(&mut self, node: &mut Program) {
-        if !self.semantic.exported_binding.is_empty() {
-            self.ref_rewriter = Some(RefRewriter {
-                query: ExportQuery {
-                    export_name: self.semantic.exported_binding.clone(),
-                },
-            });
-        }
         node.visit_mut_children_with(self);
     }
 
@@ -328,21 +384,57 @@ impl VisitMut for Transform {
 
     fn visit_mut_ts_namespace_decl(&mut self, node: &mut TsNamespaceDecl) {
         let id = node.id.to_id();
+        let context = self.namespace_context(id.clone(), &node.body);
+        let pushed = context.is_some();
+        self.namespace_contexts.extend(context);
         let namespace_id = self.namespace_id.replace(id);
 
         node.body.visit_mut_with(self);
 
         self.namespace_id = namespace_id;
+        if pushed {
+            self.namespace_contexts.pop();
+        }
     }
 
     fn visit_mut_ts_module_decl(&mut self, node: &mut TsModuleDecl) {
         let id = node.id.to_id();
 
+        let context = node
+            .body
+            .as_ref()
+            .and_then(|body| self.namespace_context(id.clone(), body));
+        let pushed = context.is_some();
+        self.namespace_contexts.extend(context);
+
         let namespace_id = self.namespace_id.replace(id);
 
         node.body.visit_mut_with(self);
 
         self.namespace_id = namespace_id;
+        if pushed {
+            self.namespace_contexts.pop();
+        }
+    }
+
+    fn visit_mut_ts_enum_decl(&mut self, node: &mut TsEnumDecl) {
+        // An enum IIFE has its own object parameter, but contributes no local
+        // enum binding to the surrounding namespace body's emitted scope.
+        let context = self
+            .semantic
+            .bindings
+            .container(&node.id.to_id())
+            .map(|container| NamespaceContext {
+                container,
+                object: node.id.to_id(),
+                locals: FxHashMap::default(),
+            });
+        let pushed = context.is_some();
+        self.namespace_contexts.extend(context);
+        node.members.visit_mut_with(self);
+        if pushed {
+            self.namespace_contexts.pop();
+        }
     }
 
     fn visit_mut_stmt(&mut self, node: &mut Stmt) {
@@ -402,7 +494,7 @@ impl VisitMut for Transform {
     }
 
     fn visit_mut_export_decl(&mut self, node: &mut ExportDecl) {
-        if self.ref_rewriter.is_some() {
+        if self.ref_rewriter().is_some() {
             if let Decl::Var(var_decl) = &mut node.decl {
                 // visit inner directly to bypass visit_mut_var_declarator
                 for decl in var_decl.decls.iter_mut() {
@@ -421,7 +513,7 @@ impl VisitMut for Transform {
     fn visit_mut_prop(&mut self, node: &mut Prop) {
         node.visit_mut_children_with(self);
 
-        if let Some(ref_rewriter) = self.ref_rewriter.as_mut() {
+        if let Some(mut ref_rewriter) = self.ref_rewriter() {
             ref_rewriter.exit_prop(node);
         }
     }
@@ -431,16 +523,16 @@ impl VisitMut for Transform {
             convert_flow_component_arrow(n);
         }
 
-        let ref_rewriter = self.ref_rewriter.take();
+        let in_binding = mem::replace(&mut self.in_binding, true);
         n.name.visit_mut_with(self);
-        self.ref_rewriter = ref_rewriter;
+        self.in_binding = in_binding;
         n.init.visit_mut_with(self);
     }
 
     fn visit_mut_pat(&mut self, node: &mut Pat) {
         node.visit_mut_children_with(self);
 
-        if let Some(ref_rewriter) = self.ref_rewriter.as_mut() {
+        if let Some(mut ref_rewriter) = self.ref_rewriter() {
             ref_rewriter.exit_pat(node);
         }
     }
@@ -460,7 +552,7 @@ impl VisitMut for Transform {
 
         maybe_grow_default(|| node.visit_mut_children_with(self));
 
-        if let Some(ref_rewriter) = self.ref_rewriter.as_mut() {
+        if let Some(mut ref_rewriter) = self.ref_rewriter() {
             ref_rewriter.exit_expr(node);
         }
     }
@@ -512,7 +604,7 @@ impl VisitMut for Transform {
 
         node.visit_mut_children_with(self);
 
-        if let Some(ref_rewriter) = self.ref_rewriter.as_mut() {
+        if let Some(mut ref_rewriter) = self.ref_rewriter() {
             ref_rewriter.exit_simple_assign_target(node);
         }
     }
@@ -520,7 +612,7 @@ impl VisitMut for Transform {
     fn visit_mut_jsx_element_name(&mut self, node: &mut JSXElementName) {
         node.visit_mut_children_with(self);
 
-        if let Some(ref_rewriter) = self.ref_rewriter.as_mut() {
+        if let Some(mut ref_rewriter) = self.ref_rewriter() {
             ref_rewriter.exit_jsx_element_name(node);
         }
     }
@@ -528,7 +620,7 @@ impl VisitMut for Transform {
     fn visit_mut_jsx_object(&mut self, node: &mut JSXObject) {
         node.visit_mut_children_with(self);
 
-        if let Some(ref_rewriter) = self.ref_rewriter.as_mut() {
+        if let Some(mut ref_rewriter) = self.ref_rewriter() {
             ref_rewriter.exit_jsx_object(node);
         }
     }
@@ -536,7 +628,7 @@ impl VisitMut for Transform {
     fn visit_mut_object_pat_prop(&mut self, n: &mut ObjectPatProp) {
         n.visit_mut_children_with(self);
 
-        if let Some(ref_rewriter) = self.ref_rewriter.as_mut() {
+        if let Some(mut ref_rewriter) = self.ref_rewriter() {
             ref_rewriter.exit_object_pat_prop(n);
         }
     }
@@ -672,8 +764,12 @@ impl VisitMut for Transform {
         node.visit_mut_children_with(self);
     }
 
-    fn visit_mut_ts_import_equals_decl(&mut self, _: &mut TsImportEqualsDecl) {
-        // id should be left intact for runtime rewriting
+    fn visit_mut_ts_import_equals_decl(&mut self, node: &mut TsImportEqualsDecl) {
+        if let TsModuleRef::TsEntityName(name) = &mut node.module_ref {
+            if let Some(rewriter) = self.ref_rewriter() {
+                rewriter.query.rewrite_entity_name(name);
+            }
+        }
     }
 
     fn visit_mut_ts_param_prop(&mut self, node: &mut TsParamProp) {
@@ -1881,16 +1977,91 @@ impl Transform {
     }
 }
 
-struct ExportQuery {
-    export_name: FxHashMap<Id, Option<Id>>,
+enum RuntimeAccess<'a> {
+    Local(&'a Id),
+    NamespaceProperty(&'a Id),
 }
 
-impl QueryRef for ExportQuery {
-    fn query_ref(&self, export_name: &Ident) -> Option<Box<Expr>> {
+struct ExportQuery<'a> {
+    export_name: &'a FxHashMap<Id, Option<Id>>,
+    bindings: &'a TsBindings,
+    contexts: &'a [NamespaceContext],
+}
+
+impl ExportQuery<'_> {
+    fn runtime_access(&self, ident: &Ident) -> Option<RuntimeAccess<'_>> {
+        let id = ident.to_id();
+        let declaration = self.bindings.declaration_id(&id);
+        let container = declaration.and_then(|id| self.bindings.declaration_container(id));
+        let member = declaration.and_then(|id| self.bindings.declaration_member(id));
+
+        for context in self.contexts.iter().rev() {
+            if container == Some(context.container) {
+                return Some(RuntimeAccess::Local(&context.object));
+            }
+
+            if let Some(member) = member {
+                if self.bindings.member(member).owner == context.container {
+                    return Some(match context.locals.get(&member) {
+                        Some(local) => RuntimeAccess::Local(local),
+                        None => RuntimeAccess::NamespaceProperty(&context.object),
+                    });
+                }
+            }
+        }
+
+        // A shared namespace member requires a current emitted owner. Never
+        // use an object parameter belonging to a different declaration body.
+        if member.is_some() {
+            return None;
+        }
         self.export_name
-            .get(&export_name.to_id())?
-            .clone()
-            .map(|namespace_id| namespace_id.make_member(export_name.clone().into()).into())
+            .get(&id)?
+            .as_ref()
+            .map(RuntimeAccess::NamespaceProperty)
+    }
+
+    fn rewrite_entity_name(&self, name: &mut TsEntityName) {
+        match name {
+            TsEntityName::TsQualifiedName(qualified) => {
+                self.rewrite_entity_name(&mut qualified.left);
+            }
+            TsEntityName::Ident(ident) => match self.runtime_access(ident) {
+                Some(RuntimeAccess::Local(local)) => {
+                    ident.sym = local.0.clone();
+                    ident.ctxt = local.1;
+                }
+                Some(RuntimeAccess::NamespaceProperty(object)) => {
+                    let qualified = TsQualifiedName {
+                        span: ident.span,
+                        left: TsEntityName::Ident(Ident::new(
+                            object.0.clone(),
+                            ident.span,
+                            object.1,
+                        )),
+                        right: ident.clone().into(),
+                    };
+                    *name = TsEntityName::TsQualifiedName(Box::new(qualified));
+                }
+                None => {}
+            },
+            #[cfg(swc_ast_unknown)]
+            _ => {}
+        }
+    }
+}
+
+impl QueryRef for ExportQuery<'_> {
+    fn query_ref(&self, ident: &Ident) -> Option<Box<Expr>> {
+        match self.runtime_access(ident)? {
+            RuntimeAccess::Local(local) if *local != ident.to_id() => {
+                Some(Ident::new(local.0.clone(), ident.span, local.1).into())
+            }
+            RuntimeAccess::Local(_) => None,
+            RuntimeAccess::NamespaceProperty(object) => {
+                Some(object.clone().make_member(ident.clone().into()).into())
+            }
+        }
     }
 
     fn query_lhs(&self, ident: &Ident) -> Option<Box<Expr>> {
@@ -1898,17 +2069,20 @@ impl QueryRef for ExportQuery {
     }
 
     fn query_jsx(&self, ident: &Ident) -> Option<JSXElementName> {
-        self.export_name
-            .get(&ident.to_id())?
-            .clone()
-            .map(|namespace_id| {
+        match self.runtime_access(ident)? {
+            RuntimeAccess::Local(local) if *local != ident.to_id() => Some(JSXElementName::Ident(
+                Ident::new(local.0.clone(), ident.span, local.1),
+            )),
+            RuntimeAccess::Local(_) => None,
+            RuntimeAccess::NamespaceProperty(object) => Some(
                 JSXMemberExpr {
-                    span: DUMMY_SP,
-                    obj: JSXObject::Ident(namespace_id.into()),
+                    span: ident.span,
+                    obj: JSXObject::Ident(Ident::new(object.0.clone(), ident.span, object.1)),
                     prop: ident.clone().into(),
                 }
-                .into()
-            })
+                .into(),
+            ),
+        }
     }
 }
 
